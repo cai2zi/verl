@@ -22,33 +22,23 @@ from verl.experimental.reward_loop.reward_manager.base import RewardManagerBase
 from verl.utils.reward_score import default_compute_score
 
 
-@register("naive")
-class NaiveRewardManager(RewardManagerBase):
-    """The reward manager."""
+@register("batch")
+class BatchRewardManager(RewardManagerBase):
+    """Reward manager that calls a custom reward function once per DataProto batch."""
 
     def __init__(self, config, tokenizer, compute_score, reward_router_address=None, reward_model_tokenizer=None):
         super().__init__(config, tokenizer, compute_score)
         self.compute_score = compute_score or default_compute_score
         self.is_async_reward_score = inspect.iscoroutinefunction(self.compute_score)
-        self.supports_batch_compute_score = self._supports_batch_compute_score(self.compute_score)
         self.reward_router_address = reward_router_address
         self.reward_model_tokenizer = reward_model_tokenizer
-
-    @staticmethod
-    def _supports_batch_compute_score(compute_score) -> bool:
-        try:
-            params = inspect.signature(compute_score).parameters
-        except (TypeError, ValueError):
-            return False
-        return all(name in params for name in ("data_sources", "solution_strs", "ground_truths", "extra_infos"))
 
     @staticmethod
     def _to_reward_output(result: Any) -> dict:
         reward_extra_info = {}
         if isinstance(result, dict):
             score = result["score"]
-            for key, value in result.items():
-                reward_extra_info[key] = value
+            reward_extra_info.update(result)
         else:
             score = result
             reward_extra_info["acc"] = score
@@ -63,8 +53,8 @@ class NaiveRewardManager(RewardManagerBase):
         }
 
     async def _prepare_batch_inputs(self, data: DataProto):
+        loop = asyncio.get_running_loop()
         data_sources = []
-        solution_strs = []
         ground_truths = []
         extra_infos = []
         decode_tasks = []
@@ -91,72 +81,26 @@ class NaiveRewardManager(RewardManagerBase):
             extra_infos.append(extra_info)
 
             decode_tasks.append(
-                self.loop.run_in_executor(
+                loop.run_in_executor(
                     None,
                     lambda ids=valid_response_ids: self.tokenizer.decode(ids, skip_special_tokens=True),
                 )
             )
 
-        if decode_tasks:
-            solution_strs = list(await asyncio.gather(*decode_tasks))
-
+        solution_strs = list(await asyncio.gather(*decode_tasks)) if decode_tasks else []
         return data_sources, solution_strs, ground_truths, extra_infos
 
     async def run_single(self, data: DataProto) -> dict:
         assert len(data) == 1, "Only support single data item"
-        data_item = data[0]
-        response_ids = data_item.batch["responses"]
-        response_length = response_ids.shape[-1]
-        valid_response_length = data_item.batch["attention_mask"][-response_length:].sum()
-        valid_response_ids = response_ids[:valid_response_length]
-
-        data_source = data_item.non_tensor_batch["data_source"]
-        ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
-        extra_info = data_item.non_tensor_batch.get("extra_info", {})
-        tool_extra_fields = data_item.non_tensor_batch.get("tool_extra_fields", None)
-        if tool_extra_fields is not None:
-            extra_info.update(tool_extra_fields.items())
-
-        num_turns = data_item.non_tensor_batch.get("__num_turns__", None)
-        rollout_reward_scores = data_item.non_tensor_batch.get("reward_scores", {})
-        extra_info["num_turns"] = num_turns
-        extra_info["rollout_reward_scores"] = rollout_reward_scores
-
-        response_str = await self.loop.run_in_executor(
-            None, lambda: self.tokenizer.decode(valid_response_ids, skip_special_tokens=True)
-        )
-
-        extra_reward_kwargs = self._extra_reward_kwargs()
-        if self.is_async_reward_score:
-            result = await self.compute_score(
-                data_source=data_source,
-                solution_str=response_str,
-                ground_truth=ground_truth,
-                extra_info=extra_info,
-                **extra_reward_kwargs,
-            )
-        else:
-            result = await self.loop.run_in_executor(
-                None,
-                lambda: self.compute_score(
-                    data_source=data_source,
-                    solution_str=response_str,
-                    ground_truth=ground_truth,
-                    extra_info=extra_info,
-                    **extra_reward_kwargs,
-                ),
-            )
-
-        return self._to_reward_output(result)
+        return (await self.run_batch(data))[0]
 
     async def run_batch(self, data: DataProto) -> list[dict]:
-        if not self.supports_batch_compute_score:
-            return await super().run_batch(data)
         if len(data) == 0:
             return []
 
         data_sources, solution_strs, ground_truths, extra_infos = await self._prepare_batch_inputs(data)
         extra_reward_kwargs = self._extra_reward_kwargs()
+        loop = asyncio.get_running_loop()
         if self.is_async_reward_score:
             results = await self.compute_score(
                 data_sources=data_sources,
@@ -166,7 +110,7 @@ class NaiveRewardManager(RewardManagerBase):
                 **extra_reward_kwargs,
             )
         else:
-            results = await self.loop.run_in_executor(
+            results = await loop.run_in_executor(
                 None,
                 lambda: self.compute_score(
                     data_sources=data_sources,
@@ -176,6 +120,8 @@ class NaiveRewardManager(RewardManagerBase):
                     **extra_reward_kwargs,
                 ),
             )
+        if inspect.isawaitable(results):
+            results = await results
 
         if not isinstance(results, (list, tuple)):
             if len(data) == 1:

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import logging
 import os
 from abc import ABC, abstractmethod
@@ -56,3 +57,9 @@ class RewardManagerBase(ABC):
     @abstractmethod
     async def run_single(self, data: DataProto):
         raise NotImplementedError
+
+    async def run_batch(self, data: DataProto) -> list[dict]:
+        tasks = []
+        for i in range(len(data)):
+            tasks.append(asyncio.create_task(self.run_single(data[i : i + 1])))
+        return await asyncio.gather(*tasks)

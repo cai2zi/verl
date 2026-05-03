@@ -416,6 +416,14 @@ class AgentLoopWorker:
             response_mask: | 1, 1, 1, ..., 1, 1 | 0, 0, .., 0, 0 | 1, 1, 1, ..., 1, 1 | 0, 0, ..., 0|
         """
         config = self.rollout_config
+        trace_enabled = os.getenv("STEP_PROOF_RL_TRACE", "1") != "0"
+        if trace_enabled:
+            print(
+                "[builder] AgentLoopWorker.generate_sequences "
+                f"batch_size={len(batch)} validate={batch.meta_info.get('validate', False)} "
+                f"global_steps={batch.meta_info.get('global_steps', -1)}",
+                flush=True,
+            )
         sampling_params = dict(
             temperature=config.temperature,
             top_p=config.top_p,
@@ -474,6 +482,13 @@ class AgentLoopWorker:
         output = self._postprocess(
             outputs, input_non_tensor_batch=batch.non_tensor_batch, validate=batch.meta_info.get("validate", False)
         )
+        if trace_enabled:
+            print(
+                "[builder] AgentLoopWorker.generate_sequences done "
+                f"batch_size={len(batch)} validate={batch.meta_info.get('validate', False)} "
+                f"global_steps={batch.meta_info.get('global_steps', -1)}",
+                flush=True,
+            )
         return output
 
     async def _run_agent_loop(
