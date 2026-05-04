@@ -14,6 +14,7 @@
 import functools
 import logging
 import os
+import time
 from contextlib import nullcontext
 from copy import deepcopy
 from functools import partial
@@ -55,6 +56,18 @@ from verl.workers.utils.losses import ppo_loss
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
+
+
+def _rl_train_trace_enabled() -> bool:
+    return os.getenv("STEP_PROOF_RL_TRAIN_TRACE", "0").strip().lower() not in {"", "0", "false", "no", "off"}
+
+
+def _rl_worker_stage_log(stage: str, event: str, **fields) -> None:
+    if not _rl_train_trace_enabled():
+        return
+    payload = {"stage": stage, "event": event, "pid": os.getpid()}
+    payload.update(fields)
+    print("[rl_train_worker] " + " ".join(f"{key}={value}" for key, value in payload.items()), flush=True)
 
 
 def _with_routing_replay_flag(enabled: bool):
@@ -279,8 +292,34 @@ class TrainingWorker(Worker, DistProfilerExtension):
             # update
             output_lst = []
             total_num_iterations = data.shape[0] // mini_batch_size_per_gpu * epochs
+            progress_every = max(1, int(os.getenv("STEP_PROOF_RL_UPDATE_PROGRESS_EVERY", "1") or 1))
+            dp_rank = self.engine.get_data_parallel_rank()
+            dp_size = self.engine.get_data_parallel_size()
+            _rl_worker_stage_log(
+                "actor_update",
+                "start",
+                dp_rank=dp_rank,
+                dp_size=dp_size,
+                batch_size_per_dp=batch_size_per_dp,
+                mini_batch_size_per_gpu=mini_batch_size_per_gpu,
+                epochs=epochs,
+                total_iterations=total_num_iterations,
+            )
 
             for batch_idx, mini_batch_td in enumerate(dataloader):
+                iter_start = time.perf_counter()
+                should_log_progress = (
+                    batch_idx == 0
+                    or batch_idx == total_num_iterations - 1
+                    or (batch_idx + 1) % progress_every == 0
+                )
+                if should_log_progress:
+                    _rl_worker_stage_log(
+                        "actor_update",
+                        "mini_batch_start",
+                        dp_rank=dp_rank,
+                        iteration=f"{batch_idx + 1}/{total_num_iterations}",
+                    )
                 # add global token num
                 if "input_ids" in mini_batch_td:
                     global_token_num = mini_batch_td["input_ids"].offsets().diff().tolist()  # (total_nnz,)
@@ -303,6 +342,14 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 )
                 actor_output = self.train_batch(mini_batch_td)
                 output_lst.append(actor_output)
+                if should_log_progress:
+                    _rl_worker_stage_log(
+                        "actor_update",
+                        "mini_batch_done",
+                        dp_rank=dp_rank,
+                        iteration=f"{batch_idx + 1}/{total_num_iterations}",
+                        elapsed_s=f"{time.perf_counter() - iter_start:.2f}",
+                    )
 
             if self.engine.is_mp_src_rank_with_outputs():
                 actor_output = [tu.get(output, "metrics") for output in output_lst]
@@ -321,6 +368,12 @@ class TrainingWorker(Worker, DistProfilerExtension):
                 output = tu.get_tensordict(tensor_dict={}, non_tensor_dict={"metrics": metrics}).cpu()
             else:
                 output = None
+            _rl_worker_stage_log(
+                "actor_update",
+                "done",
+                dp_rank=dp_rank,
+                total_iterations=total_num_iterations,
+            )
         return output
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="train"), blocking=False)
@@ -674,21 +727,46 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 0. send_weights only for async training with disaggregated trainer and rollout
         if self.config.rollout.checkpoint_engine.backend != "naive":
+            stage_start = time.perf_counter()
+            _rl_worker_stage_log("update_weights", "send_weights_start", global_steps=global_steps)
             per_tensor_param, _ = self.actor.engine.get_per_tensor_param()
             await self.checkpoint_engine.send_weights(per_tensor_param)
+            _rl_worker_stage_log(
+                "update_weights",
+                "send_weights_done",
+                global_steps=global_steps,
+                elapsed_s=f"{time.perf_counter() - stage_start:.2f}",
+            )
             return
 
+        _rl_worker_stage_log("update_weights", "start", global_steps=global_steps)
         set_expandable_segments(False)
         log_gpu_memory_usage("Before resume weights", logger=logger)
 
         # 1. resume rollout memory (weights were released during sleep)
         if self.config.rollout.free_cache_engine:
+            stage_start = time.perf_counter()
+            _rl_worker_stage_log("update_weights", "resume_weights_start", global_steps=global_steps)
             await self.rollout.resume(tags=["weights"])
+            _rl_worker_stage_log(
+                "update_weights",
+                "resume_weights_done",
+                global_steps=global_steps,
+                elapsed_s=f"{time.perf_counter() - stage_start:.2f}",
+            )
         log_gpu_memory_usage("After resume weights", logger=logger)
 
         # 2. determine if we need a base weight sync (adapter path only)
+        stage_start = time.perf_counter()
+        _rl_worker_stage_log("update_weights", "collect_params_start", global_steps=global_steps)
         per_tensor_param, peft_config = self.actor.engine.get_per_tensor_param(
             layered_summon=self.layered_summon, base_sync_done=True
+        )
+        _rl_worker_stage_log(
+            "update_weights",
+            "collect_params_done",
+            global_steps=global_steps,
+            elapsed_s=f"{time.perf_counter() - stage_start:.2f}",
         )
 
         do_lora_base_sync = False
@@ -698,31 +776,64 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # 3. sync weights: For SGLang, we need base first (when needed), then adapter/merged
         if do_lora_base_sync:
+            stage_start = time.perf_counter()
+            _rl_worker_stage_log("update_weights", "sync_base_start", global_steps=global_steps)
             per_tensor_param_base, peft_config = self.actor.engine.get_per_tensor_param(
                 layered_summon=self.layered_summon, base_sync_done=False
             )
             await self.rollout.update_weights(
                 per_tensor_param_base, peft_config=peft_config, base_sync_done=False, global_steps=global_steps
             )
+            _rl_worker_stage_log(
+                "update_weights",
+                "sync_base_done",
+                global_steps=global_steps,
+                elapsed_s=f"{time.perf_counter() - stage_start:.2f}",
+            )
 
+        stage_start = time.perf_counter()
+        _rl_worker_stage_log("update_weights", "sync_adapter_start", global_steps=global_steps)
         await self.rollout.update_weights(
             per_tensor_param, peft_config=peft_config, base_sync_done=True, global_steps=global_steps
+        )
+        _rl_worker_stage_log(
+            "update_weights",
+            "sync_adapter_done",
+            global_steps=global_steps,
+            elapsed_s=f"{time.perf_counter() - stage_start:.2f}",
         )
 
         log_gpu_memory_usage("After update_weights", logger=logger)
 
         # 3. offload model to cpu
         if self.actor.engine.is_param_offload_enabled:
+            stage_start = time.perf_counter()
+            _rl_worker_stage_log("update_weights", "offload_params_start", global_steps=global_steps)
             self.actor.engine.to("cpu", model=True, optimizer=False, grad=False)
+            _rl_worker_stage_log(
+                "update_weights",
+                "offload_params_done",
+                global_steps=global_steps,
+                elapsed_s=f"{time.perf_counter() - stage_start:.2f}",
+            )
         aggressive_empty_cache(force_sync=True)
 
         # 4. resume kv_cache
         if self.config.rollout.free_cache_engine:
+            stage_start = time.perf_counter()
+            _rl_worker_stage_log("update_weights", "resume_kv_cache_start", global_steps=global_steps)
             await self.rollout.resume(tags=["kv_cache"])
+            _rl_worker_stage_log(
+                "update_weights",
+                "resume_kv_cache_done",
+                global_steps=global_steps,
+                elapsed_s=f"{time.perf_counter() - stage_start:.2f}",
+            )
         log_gpu_memory_usage("After resume kv_cache", logger=logger)
 
         self.base_sync_done = True
         set_expandable_segments(True)
+        _rl_worker_stage_log("update_weights", "done", global_steps=global_steps)
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE, blocking=False)
     def execute_checkpoint_engine(self, method: str, *args, **kwargs):

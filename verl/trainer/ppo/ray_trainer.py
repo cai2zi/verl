@@ -20,6 +20,7 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import json
 import os
+import time
 import uuid
 from collections import defaultdict
 from copy import deepcopy
@@ -72,6 +73,15 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.rollout.llm_server import LLMServerManager
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+
+def _fdg_train_trace_enabled() -> bool:
+    return os.getenv("STEP_PROOF_RL_TRAIN_TRACE", os.getenv("STEP_PROOF_RL_TRACE", "1")) != "0"
+
+
+def _fdg_train_log(message: str) -> None:
+    if _fdg_train_trace_enabled():
+        print(f"[rl_train_stage] {message}", flush=True)
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, kl_penalty="kl"):
@@ -301,6 +311,7 @@ class RayPPOTrainer:
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
         )
+        self._fdg_reward_sample_file_initialized = False
 
         # if ref_in_actor is True, the reference policy will be actor without lora applied
         lora_rank = config.actor_rollout_ref.model.get("lora", {}).get("rank", 0)
@@ -462,6 +473,130 @@ class RayPPOTrainer:
                 reward_extra_infos_dict=reward_extra_infos_to_dump,
                 dump_path=rollout_data_dir,
             )
+
+    @staticmethod
+    def _fdg_jsonable(value):
+        if isinstance(value, np.ndarray):
+            return value.tolist()
+        if torch.is_tensor(value):
+            return value.detach().cpu().tolist()
+        if isinstance(value, np.generic):
+            return value.item()
+        if isinstance(value, dict):
+            return {str(k): RayPPOTrainer._fdg_jsonable(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [RayPPOTrainer._fdg_jsonable(v) for v in value]
+        return value
+
+    @staticmethod
+    def _fdg_indexed(mapping: dict, key: str, index: int, default=None):
+        if key not in mapping:
+            return default
+        values = mapping[key]
+        try:
+            value = values[index]
+        except Exception:
+            return default
+        return RayPPOTrainer._fdg_jsonable(value)
+
+    def _log_fdg_reward_samples(
+        self,
+        batch: DataProto,
+        reward_tensor: torch.Tensor,
+        reward_extra_infos_dict: dict,
+        timing_raw: dict,
+    ):
+        sample_count = int(self.config.trainer.get("fdg_reward_log_samples_per_step", 0) or 0)
+        log_all_groups = sample_count < 0
+        if sample_count == 0:
+            return
+        log_path = self.config.trainer.get("fdg_reward_sample_log_path", None)
+        if not log_path:
+            return
+
+        with marked_timer("dump_fdg_reward_samples", timing_raw, color="green"):
+            if not self._fdg_reward_sample_file_initialized:
+                log_dir = os.path.dirname(log_path)
+                if log_dir:
+                    os.makedirs(log_dir, exist_ok=True)
+                with open(log_path, "w", encoding="utf-8"):
+                    pass
+                self._fdg_reward_sample_file_initialized = True
+            prompts = self.tokenizer.batch_decode(batch.batch["prompts"], skip_special_tokens=True)
+            responses = self.tokenizer.batch_decode(batch.batch["responses"], skip_special_tokens=True)
+            rewards = reward_tensor.sum(dim=-1).detach().cpu().tolist()
+
+            selected_groups = {}
+            ordered_keys = []
+            for index in range(len(batch)):
+                data_item = batch[index]
+                extra_info = data_item.non_tensor_batch.get("extra_info", {}) or {}
+                if not isinstance(extra_info, dict):
+                    extra_info = {}
+                uid = str(data_item.non_tensor_batch.get("uid", "") or extra_info.get("uid", "")).strip()
+                record_id = str(extra_info.get("record_id", "")).strip()
+                group_key = uid or record_id or prompts[index]
+                if group_key not in selected_groups:
+                    if not log_all_groups and len(ordered_keys) >= sample_count:
+                        continue
+                    reward_model = data_item.non_tensor_batch.get("reward_model", {}) or {}
+                    if not isinstance(reward_model, dict):
+                        reward_model = {}
+                    selected_groups[group_key] = {
+                        "step": self.global_steps,
+                        "uid": uid,
+                        "record_id": record_id,
+                        "data_source": self._fdg_jsonable(data_item.non_tensor_batch.get("data_source", "")),
+                        "prompt": prompts[index],
+                        "ground_truth": reward_model.get("ground_truth"),
+                        "extra_info": self._fdg_jsonable(extra_info),
+                        "rollouts": [],
+                    }
+                    ordered_keys.append(group_key)
+
+                reward_trace = self._fdg_indexed(reward_extra_infos_dict, "fdg_reward_trace", index)
+                rollout = {
+                    "rollout_index": len(selected_groups[group_key]["rollouts"]),
+                    "builder_output": responses[index],
+                    "reward": rewards[index],
+                    "fdg_reward_trace": reward_trace,
+                    "score": self._fdg_indexed(reward_extra_infos_dict, "score", index, rewards[index]),
+                    "structure_score": self._fdg_indexed(reward_extra_infos_dict, "structure_score", index),
+                    "formalizer_score": self._fdg_indexed(reward_extra_infos_dict, "formalizer_score", index),
+                    "prover_score": self._fdg_indexed(reward_extra_infos_dict, "prover_score", index),
+                    "final_answer_score": self._fdg_indexed(reward_extra_infos_dict, "final_answer_score", index),
+                    "length_penalty": self._fdg_indexed(reward_extra_infos_dict, "length_penalty", index),
+                    "valid_json": self._fdg_indexed(reward_extra_infos_dict, "valid_json", index),
+                    "validator_passed": self._fdg_indexed(reward_extra_infos_dict, "validator_passed", index),
+                }
+                selected_groups[group_key]["rollouts"].append(rollout)
+
+            rows = [selected_groups[key] for key in ordered_keys]
+            if not rows:
+                return
+            with open(log_path, "a", encoding="utf-8") as f:
+                for row in rows:
+                    f.write(json.dumps(self._fdg_jsonable(row), ensure_ascii=False, default=str) + "\n")
+
+    def _fdg_batch_size(self, batch: DataProto | None) -> int | str:
+        if batch is None:
+            return "n/a"
+        try:
+            return len(batch.batch)
+        except Exception:
+            return "n/a"
+
+    def _fdg_stage_log(self, stage: str, event: str, **fields: Any) -> None:
+        if not _fdg_train_trace_enabled():
+            return
+        payload = {
+            "step": self.global_steps,
+            "total_steps": getattr(self, "total_training_steps", "n/a"),
+            "stage": stage,
+            "event": event,
+        }
+        payload.update(fields)
+        _fdg_train_log(" ".join(f"{key}={value}" for key, value in payload.items()))
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1335,6 +1470,7 @@ class RayPPOTrainer:
                     self.actor_rollout_wg.async_calls_finalize_fn_exec(blocking=False)
                 metrics = {}
                 timing_raw = {}
+                self._fdg_stage_log("step", "start", epoch=epoch)
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(
@@ -1362,6 +1498,13 @@ class RayPPOTrainer:
                 with marked_timer("step", timing_raw):
                     # generate a batch
                     with marked_timer("gen", timing_raw, color="red"):
+                        stage_start = time.perf_counter()
+                        self._fdg_stage_log(
+                            "gen",
+                            "start",
+                            input_batch=self._fdg_batch_size(gen_batch_output),
+                            rollout_n=self.config.actor_rollout_ref.rollout.n,
+                        )
                         if curr_step_profile:
                             self.llm_server_manager.start_profile()
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
@@ -1371,6 +1514,12 @@ class RayPPOTrainer:
 
                         timing_raw.update(gen_batch_output.meta_info["timing"])
                         gen_batch_output.meta_info.pop("timing", None)
+                        self._fdg_stage_log(
+                            "gen",
+                            "done",
+                            elapsed_s=f"{time.perf_counter() - stage_start:.2f}",
+                            output_batch=self._fdg_batch_size(gen_batch_output),
+                        )
 
                     if self.config.algorithm.adv_estimator == AdvantageEstimator.REMAX:
                         with marked_timer("gen_max", timing_raw, color="purple"):
@@ -1423,6 +1572,8 @@ class RayPPOTrainer:
                         images_seqlens_all.extend(multi_modal_input["images_seqlens"].tolist())
                     batch.meta_info["images_seqlens"] = images_seqlens_all
                     with marked_timer("reward", timing_raw, color="yellow"):
+                        stage_start = time.perf_counter()
+                        self._fdg_stage_log("reward", "start", batch=self._fdg_batch_size(batch))
                         # compute reward model score
                         if self.use_rm and "rm_scores" not in batch.batch.keys():
                             batch_reward = self._compute_reward_colocate(batch)
@@ -1430,6 +1581,18 @@ class RayPPOTrainer:
 
                         # extract reward_tensor and reward_extra_infos_dict for training
                         reward_tensor, reward_extra_infos_dict = extract_reward(batch)
+                        self._log_fdg_reward_samples(
+                            batch,
+                            reward_tensor,
+                            reward_extra_infos_dict,
+                            timing_raw,
+                        )
+                        self._fdg_stage_log(
+                            "reward",
+                            "done",
+                            elapsed_s=f"{time.perf_counter() - stage_start:.2f}",
+                            batch=self._fdg_batch_size(batch),
+                        )
 
                     # Operating Mode Selection:
                     # - Bypass mode: Sets old_log_probs = rollout_log_probs (2 policies: π_rollout, π_θ)
@@ -1447,6 +1610,8 @@ class RayPPOTrainer:
                         )
                     else:  # Recompute old_log_probs
                         with marked_timer("old_log_prob", timing_raw, color="blue"):
+                            stage_start = time.perf_counter()
+                            self._fdg_stage_log("old_log_prob", "start", batch=self._fdg_batch_size(batch))
                             old_log_prob, old_log_prob_mfu = self._compute_old_log_prob(batch)
                             entropys = old_log_prob.batch["entropys"]
                             response_masks = batch.batch["response_mask"]
@@ -1472,6 +1637,12 @@ class RayPPOTrainer:
                                     "it should not be set when using R2 mode."
                                 )
                             batch = batch.union(old_log_prob)
+                            self._fdg_stage_log(
+                                "old_log_prob",
+                                "done",
+                                elapsed_s=f"{time.perf_counter() - stage_start:.2f}",
+                                mfu=f"{old_log_prob_mfu:.4f}",
+                            )
                             if "rollout_log_probs" in batch.batch.keys():
                                 # TODO: we may want to add diff of probs too.
                                 from verl.utils.debug.metrics import calculate_debug_metrics
@@ -1483,16 +1654,28 @@ class RayPPOTrainer:
                     if self.use_reference_policy:
                         # compute reference log_prob
                         with marked_timer(str(Role.RefPolicy), timing_raw, color="olive"):
+                            stage_start = time.perf_counter()
+                            self._fdg_stage_log("ref_log_prob", "start", batch=self._fdg_batch_size(batch))
                             ref_log_prob = self._compute_ref_log_prob(batch)
                             batch = batch.union(ref_log_prob)
+                            self._fdg_stage_log(
+                                "ref_log_prob",
+                                "done",
+                                elapsed_s=f"{time.perf_counter() - stage_start:.2f}",
+                            )
 
                     # compute values
                     if self.use_critic:
                         with marked_timer("values", timing_raw, color="cyan"):
+                            stage_start = time.perf_counter()
+                            self._fdg_stage_log("values", "start", batch=self._fdg_batch_size(batch))
                             values = self._compute_values(batch)
                             batch = batch.union(values)
+                            self._fdg_stage_log("values", "done", elapsed_s=f"{time.perf_counter() - stage_start:.2f}")
 
                     with marked_timer("adv", timing_raw, color="brown"):
+                        stage_start = time.perf_counter()
+                        self._fdg_stage_log("adv", "start", batch=self._fdg_batch_size(batch))
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
                         batch.batch["token_level_scores"] = reward_tensor
@@ -1538,6 +1721,7 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+                        self._fdg_stage_log("adv", "done", elapsed_s=f"{time.perf_counter() - stage_start:.2f}")
 
                     # update critic
                     if self.use_critic:
@@ -1553,7 +1737,14 @@ class RayPPOTrainer:
                     else:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
+                            stage_start = time.perf_counter()
+                            self._fdg_stage_log("update_actor", "start", batch=self._fdg_batch_size(batch))
                             actor_output = self._update_actor(batch)
+                            self._fdg_stage_log(
+                                "update_actor",
+                                "done",
+                                elapsed_s=f"{time.perf_counter() - stage_start:.2f}",
+                            )
 
                         # Check if the ESI (Elastic Server Instance)/training plan is close to expiration.
                         esi_close_to_expiration = should_save_ckpt_esi(
@@ -1575,11 +1766,25 @@ class RayPPOTrainer:
                             if esi_close_to_expiration:
                                 print("Force saving checkpoint: ESI instance expiration approaching.")
                             with marked_timer("save_checkpoint", timing_raw, color="green"):
+                                stage_start = time.perf_counter()
+                                self._fdg_stage_log("save_checkpoint", "start")
                                 self._save_checkpoint()
+                                self._fdg_stage_log(
+                                    "save_checkpoint",
+                                    "done",
+                                    elapsed_s=f"{time.perf_counter() - stage_start:.2f}",
+                                )
 
                         # update weights from trainer to rollout
                         with marked_timer("update_weights", timing_raw, color="red"):
+                            stage_start = time.perf_counter()
+                            self._fdg_stage_log("update_weights", "start")
                             self.checkpoint_manager.update_weights(self.global_steps)
+                            self._fdg_stage_log(
+                                "update_weights",
+                                "done",
+                                elapsed_s=f"{time.perf_counter() - stage_start:.2f}",
+                            )
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)
@@ -1650,6 +1855,13 @@ class RayPPOTrainer:
 
                 # TODO: make a canonical logger that supports various backend
                 logger.log(data=metrics, step=self.global_steps)
+                self._fdg_stage_log(
+                    "step",
+                    "done",
+                    elapsed_s=f"{steps_duration:.2f}",
+                    progress=f"{self.global_steps}/{self.total_training_steps}",
+                    next_step=self.global_steps + 1,
+                )
 
                 progress_bar.update(1)
                 self.global_steps += 1

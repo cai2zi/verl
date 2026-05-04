@@ -53,11 +53,10 @@ class BatchRewardManager(RewardManagerBase):
         }
 
     async def _prepare_batch_inputs(self, data: DataProto):
-        loop = asyncio.get_running_loop()
         data_sources = []
         ground_truths = []
         extra_infos = []
-        decode_tasks = []
+        solution_strs = []
 
         for i in range(len(data)):
             data_item = data[i]
@@ -74,20 +73,19 @@ class BatchRewardManager(RewardManagerBase):
             if tool_extra_fields is not None:
                 extra_info.update(tool_extra_fields.items())
 
+            if "uid" in data_item.non_tensor_batch:
+                extra_info.setdefault("uid", str(data_item.non_tensor_batch["uid"]))
+            if "global_steps" in data.meta_info:
+                extra_info.setdefault("global_steps", data.meta_info["global_steps"])
+
             num_turns = data_item.non_tensor_batch.get("__num_turns__", None)
             rollout_reward_scores = data_item.non_tensor_batch.get("reward_scores", {})
             extra_info["num_turns"] = num_turns
             extra_info["rollout_reward_scores"] = rollout_reward_scores
             extra_infos.append(extra_info)
 
-            decode_tasks.append(
-                loop.run_in_executor(
-                    None,
-                    lambda ids=valid_response_ids: self.tokenizer.decode(ids, skip_special_tokens=True),
-                )
-            )
+            solution_strs.append(self.tokenizer.decode(valid_response_ids, skip_special_tokens=True))
 
-        solution_strs = list(await asyncio.gather(*decode_tasks)) if decode_tasks else []
         return data_sources, solution_strs, ground_truths, extra_infos
 
     async def run_single(self, data: DataProto) -> dict:
